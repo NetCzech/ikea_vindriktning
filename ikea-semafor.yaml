@@ -16,22 +16,23 @@ substitutions:
   aqi_message_good: "Good"
   pm1006_pin_rx: GPIO16
   pm1006_pin_tx: GPIO17
-  pm1006_update_interval: 5s
+  pm1006_update_interval: 10s
   sensor_fan: GPIO12
   temp_calibration: "-4"
 
 esphome:
-  name: ikea-semafor
-  compile_process_limit: 1
+  name: esp32-vindriktning
   on_boot:
     priority: -10
     then:
       - light.turn_on: 
           id: led_rgb
           brightness: 30%
-          effect: "AQI Level (smooth change)"
+
 esp32:
   board: esp32dev
+  framework:
+    type: arduino
 
 # Enable logging
 logger:
@@ -39,11 +40,9 @@ logger:
 # Enable Home Assistant API
 api:
   encryption:
-    key: "type your own"
 
 ota:
-  - platform: esphome
-    password: "type your own"
+  platform: esphome
 
 wifi:
   ssid: !secret wifi_ssid
@@ -59,13 +58,13 @@ bluetooth_proxy:
 
 light:
   - id: led_rgb
-    internal: False
+    internal: false
     platform: neopixelbus
     type: GRB
     variant: WS2812X
     pin: $GPIO_RGB_LED
-    num_leds: "3"
-    method: ESP32_I2S_1
+    num_leds: 3
+    method: esp32_i2s
     name: "RGB LED indicator"
     effects:
       - addressable_lambda:
@@ -73,52 +72,67 @@ light:
           update_interval: 25ms
           lambda: |-  
             if (id(aqi).state == "Bad") {
-              it.all() = ESPColor(255,0,0); //red color
+              it.all() = Color(255,0,0); //red color
             } else if (id(aqi).state == "Acceptable") {
-              it.all() = ESPColor(255,255,0); 
+              it.all() = Color(255,255,0); 
             } else if (id(aqi).state == "Good") {
-              it.all() = ESPColor(0,255,0); //green color
+              it.all() = Color(0,255,0); //green color
             } else {
-              it.all() = ESPColor(255,255,255); //white color
+              it.all() = Color(255,255,255); //white color
             }
+
       - addressable_lambda:
           name: "AQI Level (smooth change)"
           update_interval: 25ms
           lambda: |-
-            
             static int red = 0;
             static int green = 0;
 
-            if (id(co2_value).state <= ${aqi_co2_ideal_good}) {
+            const float co2 = id(co2_value).state;
+            const float g1 = ${aqi_co2_ideal_good};
+            const float g2 = ${aqi_co2_ideal_acceptable};
+
+            if (co2 <= g1) {
               red = 0;
               green = 255;
-            } else if ((id(co2_value).state > ${aqi_co2_ideal_good}) && (id(co2_value).state <= 1000)) {
-              red = ceil(((id(co2_value).state) - ${aqi_co2_ideal_good}) * (255.0/(${aqi_co2_ideal_acceptable} - ${aqi_co2_ideal_good})));
-              green = 255;
-              
-            } else if ((id(co2_value).state > 1000) && (id(co2_value).state < 1200)) {
-              red = 255;
-              green = 255 - ceil((id(co2_value).state - 1000) * (255.0/200));
 
-            } else if (id(co2_value).state >= 1200) {
+            } else if (co2 > g1 && co2 <= 1000.0f) {
+              // přepočet 0–1
+              float t = (co2 - g1) / (g2 - g1);
+              if (t < 0.0f) t = 0.0f;
+              if (t > 1.0f) t = 1.0f;
+              red = (int)(t * 255.0f + 0.5f);
+              green = 255;
+
+            } else if (co2 > 1000.0f && co2 < 1200.0f) {
+              red = 255;
+              float t = (co2 - 1000.0f) / 200.0f;  // 1000–1200
+              if (t < 0.0f) t = 0.0f;
+              if (t > 1.0f) t = 1.0f;
+              green = (int)((1.0f - t) * 255.0f + 0.5f);
+
+            } else {  // co2 >= 1200
               red = 255;
               green = 0;
             }
-          
-            it.all() = ESPColor(red,green,0);
+
+            it.all() = Color(red, green, 0);
 
 script:
   - id: evaluate_air_quality
     then:
       - logger.log: "Fan is ON"
       - switch.turn_on: fan
-      - logger.log: "Waiting 10s"
+
+      - logger.log: "Waiting 10s for PM2.5 sampling"
       - delay: 10s
-      - sensor.template.publish:
-          id: pm2_5_value
-          state: !lambda return id(pm2_5_value).state;
+            
       - logger.log: "Fan is OFF"
       - switch.turn_off: fan
+      
+      - logger.log: "Waiting 10s for CO2 chamber"
+      - delay: 10s
+
       - if:
           condition:
             - lambda: 'return isnan(id(co2_value).state);'
@@ -197,24 +211,19 @@ sensor:
     temperature:
       name: "${node_name} teplota"
       id: temp_value
-      #on_value:
-        #then:
-        #- sensor.template.publish:
-            #id: temp_value
-            #state: !lambda return id(temp_value).state;
       filters:
-        #- lambda: return x + id(temp_calibration).state;
         offset: ${temp_calibration}
-
     humidity:
       name: "${node_name} vlhkost"
       id: humi_value
+
   - platform: pm1006
     pm_2_5:
       name: "${node_name} PM2.5"
       id: pm2_5_value
       internal: false
-    update_interval: 2min
+    update_interval: ${pm1006_update_interval}
+  
   - platform: template
     name: "${node_name} PM2.5 24h average"
     id: pm2_5_avg_24h
@@ -230,6 +239,7 @@ sensor:
     on_value:
       then:
         - script.execute: update_aqi
+  
   - platform: wifi_signal
     name: "${node_name} WiFi Signal"
     entity_category: diagnostic
@@ -280,10 +290,16 @@ font:
       - "9"
       - "0"
       - " "
-      - "nan"
-      - "µg/m³"
-      - "ppm"
-      - "°C"
+      - "n"
+      - "a"
+      - "p"
+      - "m"
+      - "µ"
+      - "g"
+      - "/"
+      - "³"
+      - "°"
+      - "C"
       - "%"
 
 number:
@@ -297,43 +313,28 @@ number:
     optimistic: true
     on_value:
       then:
-        lambda: |-
-          if (id(DISPLAY_contrast).state) {
-            id(oled_display).set_contrast(x / 100);
-          } else {
-            id(oled_display).set_contrast(0.5);
-          }
-  #- platform: template
-    #name: "Kalibrace teploty"
-    #id: temp_calibration
-    #initial_value: 0.0
-    #min_value: -5.0
-    #max_value: 5.0
-    #step: 0.1
-    #optimistic: true
-    #entity_category: config
-    #on_value:
-      #then:
-        #- sensor.template.publish:
-            #id: temp_value
-            #state: !lambda return id(temp_value).state;      
+        - lambda: |-
+            // aktuální hodnota z number entity (0–100)
+            float contrast_value = id(DISPLAY_contrast).state;
+            // převedení na rozsah 0.0–1.0 pro set_contrast
+            if (contrast_value > 0.0f) {
+              id(oled_display).set_contrast(contrast_value / 100.0f);
+            } else {
+              id(oled_display).set_contrast(0.5f);
+            }
 
 interval:
-  - interval: 1min
+  - interval: 2min
     then:
       - script.execute: evaluate_air_quality
-    
+
 display:
   - platform: ssd1306_i2c
     id: oled_display
     model: "SSD1306 128x32"
     lambda: |-
-        //static int kalibrovana_teplota = 0;
-        
-        //kalibrovana_teplota = temp_calibration + id(temp_value).state)
-
         it.printf(0, 0, id(font1), "%.0f ppm", id(co2_value).state);
         it.printf(0, 16, id(font1), "%.0f µg/m³", id(pm2_5_value).state);        
         it.printf(126, 0, id(font1), TextAlign::TOP_RIGHT, "%.0f °C", id(temp_value).state);
-        //it.printf(126, 0, id(font1), TextAlign::TOP_RIGHT, "%.0f °C", kalibrovana_teplota);
         it.printf(126, 16, id(font1), TextAlign::TOP_RIGHT, "%.0f %%", id(humi_value).state);
+
